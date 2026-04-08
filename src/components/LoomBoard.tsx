@@ -3,14 +3,15 @@
 import { useState } from 'react';
 import type { Loom, Run, Job } from '@/types';
 import LoomLane from './LoomLane';
-import { findBestPairing } from '@/lib/planning/pairing';
-import { calculateWidthAllocation } from '@/lib/planning/width';
+import { packJobsForLoom } from '@/lib/planning/pairing';
+import { calculateMultiJobAllocation } from '@/lib/planning/width';
+import { DEFAULT_PREFERRED_MAX_SPLIT } from '@/lib/planning/scoring';
 
 interface ProposedRun {
   loom: Loom;
-  job1: Job;
-  job2: Job | null;
+  jobs: Job[];
   waste: number;
+  totalAllocated: number;
 }
 
 interface LoomBoardProps {
@@ -42,7 +43,6 @@ export default function LoomBoard({
     nominal_speed: '',
   });
 
-  const [proposing, setProposing] = useState(false);
   const [proposal, setProposal] = useState<ProposedRun[] | null>(null);
   const [applying, setApplying] = useState(false);
 
@@ -75,33 +75,28 @@ export default function LoomBoard({
     const pendingJobs = jobs.filter((j) => j.status === 'pending' || !j.status);
     if (pendingJobs.length === 0 || looms.length === 0) return;
 
-    setProposing(true);
     const proposed: ProposedRun[] = [];
     const usedJobIds = new Set<string>();
 
-    // Distribute jobs across looms using best-pairing per loom
     for (const loom of looms) {
       const available = pendingJobs.filter((j) => !usedJobIds.has(j.id));
       if (available.length === 0) break;
 
-      const pairs = findBestPairing(available, loom);
-      for (const [job1, job2] of pairs) {
-        if (usedJobIds.has(job1.id)) continue;
-        const alloc = calculateWidthAllocation(
-          loom.usable_width_mm ?? 5000,
-          job1.width_mm ?? 0,
-          job2?.width_mm ?? undefined
+      const runGroups = packJobsForLoom(available, loom);
+
+      for (const group of runGroups) {
+        const alloc = calculateMultiJobAllocation(
+          loom.usable_width_mm ?? 0,
+          group.map((j) => j.width_mm ?? 0)
         );
         if (!alloc.fits) continue;
 
-        proposed.push({ loom, job1, job2, waste: alloc.waste });
-        usedJobIds.add(job1.id);
-        if (job2) usedJobIds.add(job2.id);
+        proposed.push({ loom, jobs: group, waste: alloc.waste, totalAllocated: alloc.totalAllocated });
+        for (const j of group) usedJobIds.add(j.id);
       }
     }
 
     setProposal(proposed);
-    setProposing(false);
   }
 
   async function applyProposal() {
@@ -123,26 +118,16 @@ export default function LoomBoard({
         if (!runRes.ok) continue;
         const run = await runRes.json();
 
-        await fetch('/api/run-items', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            run_id: run.id,
-            job_id: p.job1.id,
-            position: 'left',
-            width_mm: p.job1.width_mm,
-          }),
-        });
-
-        if (p.job2) {
+        for (let i = 0; i < p.jobs.length; i++) {
+          const job = p.jobs[i];
           await fetch('/api/run-items', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               run_id: run.id,
-              job_id: p.job2.id,
-              position: 'right',
-              width_mm: p.job2.width_mm,
+              job_id: job.id,
+              position: String(i),
+              width_mm: job.width_mm,
             }),
           });
         }
@@ -170,24 +155,18 @@ export default function LoomBoard({
         <div className="flex items-center gap-2">
           {selectedJob && (
             <div className="text-xs bg-[#6366f1]/10 border border-[#6366f1]/30 text-[#818cf8] px-3 py-1.5 rounded-lg">
-              Job {selectedJob.job_number} selected — click a lane to schedule
+              {selectedJob.job_number} selected — click a lane or hover a run
             </div>
           )}
 
-          {/* Propose Planning button */}
           {pendingCount > 0 && looms.length > 0 && !selectedJob && (
             <button
               onClick={buildProposal}
-              disabled={proposing}
-              className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg transition-all duration-150 focus:outline-none bg-[#6366f1] hover:bg-[#5355cc] text-white disabled:opacity-60"
+              className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg transition-all duration-150 focus:outline-none bg-[#6366f1] hover:bg-[#5355cc] text-white"
             >
-              {proposing ? (
-                <span className="w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />
-              ) : (
-                <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
-                  <path d="M1 5.5h9M5.5 1l4.5 4.5L5.5 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              )}
+              <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+                <path d="M1 5.5h9M5.5 1l4.5 4.5L5.5 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
               Propose Planning
             </button>
           )}
@@ -253,13 +232,15 @@ export default function LoomBoard({
         </div>
       )}
 
-      {/* Proposal modal */}
+      {/* Proposal panel */}
       {proposal && (
-        <div className="mx-6 mt-4 mb-0 bg-[#12121a] border border-[#6366f1]/30 rounded-xl p-4">
+        <div className="mx-6 mt-4 mb-0 bg-[#12121a] border border-[#6366f1]/30 rounded-xl p-4 shrink-0">
           <div className="flex items-center justify-between mb-3">
             <div>
               <h3 className="text-sm font-semibold text-[#e2e8f0]">Proposed Schedule</h3>
-              <p className="text-xs text-[#64748b] mt-0.5">{proposal.length} run{proposal.length !== 1 ? 's' : ''} across {new Set(proposal.map(p => p.loom.id)).size} loom{new Set(proposal.map(p => p.loom.id)).size !== 1 ? 's' : ''}</p>
+              <p className="text-xs text-[#64748b] mt-0.5">
+                {proposal.length} run{proposal.length !== 1 ? 's' : ''} · {proposal.reduce((s, p) => s + p.jobs.length, 0)} jobs
+              </p>
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -284,33 +265,50 @@ export default function LoomBoard({
               </button>
             </div>
           </div>
-          <div className="flex flex-col gap-2">
-            {proposal.map((p, i) => (
-              <div key={i} className="flex items-center gap-3 bg-[#0a0a0f] rounded-lg px-3 py-2">
-                <div className="text-xs font-medium text-[#94a3b8] w-24 truncate">{p.loom.name}</div>
-                <div className="flex-1 h-4 rounded bg-[#12121a] overflow-hidden flex">
-                  <div
-                    className="bg-[#6366f1]/70 h-full"
-                    style={{ width: `${((p.job1.width_mm ?? 0) / (p.loom.usable_width_mm ?? 1)) * 100}%` }}
-                    title={p.job1.job_number ?? ''}
-                  />
-                  {p.job2 && (
-                    <div
-                      className="bg-[#10b981]/70 h-full"
-                      style={{ width: `${((p.job2.width_mm ?? 0) / (p.loom.usable_width_mm ?? 1)) * 100}%` }}
-                      title={p.job2.job_number ?? ''}
-                    />
-                  )}
-                  <div className="bg-[#1e1e2e] h-full flex-1" />
-                </div>
-                <div className="text-[10px] text-[#64748b] w-28 text-right truncate">
-                  {p.job1.job_number}{p.job2 ? ` + ${p.job2.job_number}` : ''} · {p.waste}mm waste
-                </div>
-              </div>
-            ))}
+
+          <div className="flex flex-col gap-2 max-h-52 overflow-y-auto">
             {proposal.length === 0 && (
-              <p className="text-xs text-[#64748b] text-center py-2">No valid pairings found for pending jobs</p>
+              <p className="text-xs text-[#64748b] text-center py-2">No valid runs found for pending jobs and available looms</p>
             )}
+            {proposal.map((p, i) => {
+              const loomW = p.loom.usable_width_mm ?? 1;
+              const splitWarning = p.jobs.length > DEFAULT_PREFERRED_MAX_SPLIT;
+              return (
+                <div key={i} className="flex items-center gap-3 bg-[#0a0a0f] rounded-lg px-3 py-2">
+                  <div className="text-xs font-medium text-[#94a3b8] w-20 truncate shrink-0">{p.loom.name}</div>
+                  {/* Width bar */}
+                  <div className="flex-1 h-5 rounded-md bg-[#12121a] overflow-hidden flex border border-[#1e1e2e]">
+                    {p.jobs.map((job, ji) => {
+                      const COLOURS = ['bg-[#6366f1]/50', 'bg-[#10b981]/50', 'bg-[#f59e0b]/50', 'bg-[#ec4899]/50', 'bg-[#06b6d4]/50'];
+                      return (
+                        <div
+                          key={job.id}
+                          className={`${COLOURS[ji % COLOURS.length]} h-full flex items-center justify-center border-r border-[#1e1e2e] last:border-r-0 shrink-0`}
+                          style={{ width: `${((job.width_mm ?? 0) / loomW) * 100}%` }}
+                          title={job.job_number ?? ''}
+                        >
+                          {((job.width_mm ?? 0) / loomW) > 0.08 && (
+                            <span className="text-[9px] text-[#e2e8f0] truncate px-0.5">{job.job_number}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {p.waste > 0 && (
+                      <div
+                        className="bg-[#0d0d15] h-full flex-1"
+                        title={`Waste: ${p.waste}mm`}
+                      />
+                    )}
+                  </div>
+                  <div className="text-[10px] text-right shrink-0 w-32">
+                    <span className="text-[#64748b]">{p.jobs.length} job{p.jobs.length !== 1 ? 's' : ''} · {p.waste}mm waste</span>
+                    {splitWarning && (
+                      <span className="ml-1 text-[#f59e0b]">⚠</span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
