@@ -144,9 +144,11 @@ export default function DashboardPage() {
           <LoomBoard
             looms={looms}
             runs={runs}
+            jobs={jobs}
             selectedJob={selectedJob}
             onRunClick={handleRunClick}
             onLoomCreated={fetchData}
+            onRunCreated={fetchData}
           />
         </main>
 
